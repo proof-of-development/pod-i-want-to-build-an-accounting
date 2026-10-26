@@ -3,35 +3,48 @@
  * server.js: money-leak and ledger-consistency audit for a small or medium creative agency.
  *
  * ACCOUNT (builder)
- * - Built: one Node HTTP server that uses only the standard library and has no dependencies.
- *   It listens on port 3000 on every interface: IPv6 "::" with dual-stack, and Node falls back to 0.0.0.0
- *   when IPv6 is not available. It makes no outbound connections.
+ * - Built: one Node HTTP server that uses only the standard library ('http') and has no dependencies.
+ *   It listens on port 3000 on every interface. With no host argument, Node binds IPv6 "::" dual-stack,
+ *   which also accepts IPv4, and falls back to 0.0.0.0 when IPv6 is unavailable.
+ *   It makes no outbound connections, reads no environment variables, files or secrets, and starts no processes.
  * - Endpoint: POST /audit. The body is a JSON array of entries
  *   [{id, date, customer, type: "invoice"|"payment", amount}].
  *   The server also accepts {"entries":[...]}.
  *   It returns {"leaks":[{id, description, customer, balance, ...extra detail}], "summary":{...}}.
  *   GET / returns a short description of the service.
- * - Made outside the repository: nothing. There are no contracts, services, accounts or keys.
+ * - Made outside the repository: nothing. There are no contracts, services, accounts or keys,
+ *   so there is nothing for the poster to take over beyond this file.
  * - Asked of the owner: nothing. No secret is needed or read.
- * - Not verified: I wrote this file but did not run it or any check against it.
- *   The server has not yet been started or exercised against sample requests.
+ * - Why this version exists: the previous version was refused because the security reviewer's reply was
+ *   not read as a clear APPROVE or REFUSE. The reviewer's text found no security fault in the code.
+ *   While re-reading the code I fixed three faults:
+ *     1. Math.min(...array) over every entry date. On a large body (tens of thousands of entries) this can
+ *        throw RangeError "Maximum call stack size exceeded". Both uses (periodStart/periodEnd and
+ *        earliestLeak) are now plain loops.
+ *     2. OPTIONS answered 204 with a Content-Length of 2 and a "{}" body. A 204 must carry no body,
+ *        so it now sends headers only.
+ *     3. A 413 (body too large) answer could be followed by a second write attempt from the 'error'
+ *        handler. Responses are now guarded by res.headersSent.
+ * - Not verified: I wrote this file in a text-only seat and could not run it. I have not started the
+ *   server or sent any request to it, so I cannot quote any real output. The lead or the reviewer should
+ *   run `node server.js` and POST a sample ledger before this is put forward.
  *
  * ASSUMPTIONS (the job left these open, so I chose the smallest honest reading)
  * - "balance" on every leak is that customer's net ledger balance: sum of invoices minus sum of payments.
- *   It uses the customer string exactly as written and only valid entries.
+ *   It uses the customer string exactly as written and counts only valid entries.
  *   A positive balance means money is owed to the agency (unpaid or short-paid work).
  *   A negative balance means the agency holds unapplied or over-received cash (a refund liability or misposting).
  * - A customer whose invoices and payments net to exactly 0 has no balance leak.
- *   Prepayments or deposits that are later invoiced are not flagged.
  * - Payments are applied first-in-first-out to the oldest open invoice.
  *   This allocation decides which invoice is "open", how old it is, and when a leak began.
- * - Ages are measured against the latest date in the submitted data, not against today.
- *   This keeps the same input producing the same output.
- * - Some entries cannot be trusted: a missing or non-numeric amount, a negative amount, an unparseable date,
- *   an unknown type, or a missing customer. These are reported as leaks and excluded from balances.
+ * - Ages are measured against the latest date in the submitted data, not against today,
+ *   so the same input always produces the same output.
+ * - These entries cannot be trusted, are reported as leaks, and are excluded from balances:
+ *   a missing or non-numeric amount, a negative amount, an unparseable date, an unknown type,
+ *   or a missing customer.
  * - Duplicate ids and same-day identical postings ARE counted in balances, because they are on the books.
  *   They are also flagged as their own leak, so the double count is visible.
- * - Zero-amount invoices are flagged, as possibly unbilled work.
+ * - Zero-amount invoices are flagged as possibly unbilled work.
  * - Name variants such as "Acme Ltd" and "acme ltd " are flagged but not merged.
  */
 
@@ -47,6 +60,15 @@ const fmt = (c) => (c < 0 ? '-' : '') + (Math.abs(c) / 100).toFixed(2);
 const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 const monthOf = (ms) => new Date(ms).toISOString().slice(0, 7);
 const normName = (s) => s.trim().toLowerCase().replace(/\s+/g, ' ');
+
+function minMax(nums) {
+  let min = null, max = null;
+  for (const n of nums) {
+    if (min === null || n < min) min = n;
+    if (max === null || n > max) max = n;
+  }
+  return [min, max];
+}
 
 function parseDate(s) {
   if (typeof s !== 'string' || !s.trim()) return null;
@@ -105,9 +127,7 @@ function audit(raw) {
     }
   });
 
-  const allDates = valid.map((r) => r.date);
-  const periodStart = allDates.length ? Math.min(...allDates) : null;
-  const periodEnd = allDates.length ? Math.max(...allDates) : null;
+  const [periodStart, periodEnd] = minMax(valid.map((r) => r.date));
   const ageAt = (d) => (periodEnd === null || d === null ? null : Math.round((periodEnd - d) / DAY));
 
   // Group by exact customer string.
@@ -119,7 +139,6 @@ function audit(raw) {
 
   const custInfo = new Map();
   const ageing = { '0-30': 0, '31-60': 0, '61-90': 0, '90+': 0 };
-  const allOpen = [];
 
   for (const [customer, recs] of byCustomer) {
     recs.sort((a, b) => a.date - b.date || a.index - b.index);
@@ -157,7 +176,6 @@ function audit(raw) {
       const a = ageAt(inv.date);
       const b = a <= 30 ? '0-30' : a <= 60 ? '31-60' : a <= 90 ? '61-90' : '90+';
       ageing[b] += inv.remaining;
-      allOpen.push({ customer, ...inv });
     }
   }
 
@@ -222,7 +240,7 @@ function audit(raw) {
       relatedIds: [h.id],
     });
     const pd = parseDate(e.date);
-    if (pd !== null) leakOrigins.push({ date: pd, cents: toCents(amt), kind: same ? 'duplicate_posting' : 'duplicate_id' });
+    if (pd !== null) leakOrigins.push({ date: pd, cents: toCents(Math.abs(amt)), kind: same ? 'duplicate_posting' : 'duplicate_id' });
   }
 
   // 3) Same customer, type, amount and date under different ids
@@ -327,6 +345,8 @@ function audit(raw) {
   const sevRank = { high: 0, medium: 1, low: 2 };
   leaks.sort((a, b) => sevRank[a.severity] - sevRank[b.severity] || Math.abs(b.amount || 0) - Math.abs(a.amount || 0));
 
+  const [earliestOrigin] = minMax(leakOrigins.map((o) => o.date));
+
   return {
     leaks,
     summary: {
@@ -335,7 +355,7 @@ function audit(raw) {
       totalInvoiced: fromCents(valid.filter((r) => r.type === 'invoice').reduce((s, r) => s + r.cents, 0)),
       totalPaid: fromCents(valid.filter((r) => r.type === 'payment').reduce((s, r) => s + r.cents, 0)),
       totalOwedToAgency: fromCents(totalUnder), totalOverReceived: fromCents(totalOver),
-      earliestLeak: leakOrigins.length ? isoDay(Math.min(...leakOrigins.map((o) => o.date))) : null,
+      earliestLeak: earliestOrigin === null ? null : isoDay(earliestOrigin),
       ageingOfOpenInvoices: Object.fromEntries(Object.entries(ageing).map(([k, v]) => [k, fromCents(v)])),
       leaksByOriginMonth: byMonth, leaksByKind: byKind, patterns,
       assumptions: [
@@ -347,21 +367,29 @@ function audit(raw) {
   };
 }
 
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
 function send(res, status, obj) {
+  if (res.headersSent || res.writableEnded) return;
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    ...CORS,
   });
   res.end(body);
 }
 
 const server = http.createServer((req, res) => {
   const path = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
-  if (req.method === 'OPTIONS') return send(res, 204, {});
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, CORS);
+    return res.end();
+  }
   if (path === '/' && req.method === 'GET') {
     return send(res, 200, {
       service: 'agency ledger audit',
@@ -377,7 +405,13 @@ const server = http.createServer((req, res) => {
   req.on('data', (c) => {
     if (aborted) return;
     size += c.length;
-    if (size > MAX_BODY) { aborted = true; send(res, 413, { error: 'body too large', leaks: [] }); req.destroy(); return; }
+    if (size > MAX_BODY) {
+      aborted = true;
+      res.setHeader('Connection', 'close');
+      send(res, 413, { error: 'body too large', leaks: [] });
+      req.resume();
+      return;
+    }
     chunks.push(c);
   });
   req.on('end', () => {
@@ -390,7 +424,11 @@ const server = http.createServer((req, res) => {
     try { send(res, 200, audit(entries)); }
     catch (e) { send(res, 500, { error: 'audit failed: ' + e.message, leaks: [] }); }
   });
-  req.on('error', () => { if (!aborted) { aborted = true; try { send(res, 400, { error: 'request error', leaks: [] }); } catch (_) {} } });
+  req.on('error', () => {
+    if (aborted) return;
+    aborted = true;
+    send(res, 400, { error: 'request error', leaks: [] });
+  });
 });
 
 // No host argument: Node binds every interface (IPv6 "::" dual-stack, or 0.0.0.0 when IPv6 is unavailable).
