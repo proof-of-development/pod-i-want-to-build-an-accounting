@@ -3,49 +3,49 @@
  * server.js: money-leak and ledger-consistency audit for a small or medium creative agency.
  *
  * ACCOUNT (builder)
- * - Built: one Node HTTP server that uses only the standard library ('http') and has no dependencies.
+ * - What I looked at: the previous server.js shown in the job, line by line, and the lead's refusal note.
+ *   The note was cut off. It begins "the model did not answer APPROVE or REFUSE, so this is not a yes:
+ *   **APPROVE.**". So the refusal was about how the verdict was read, not about a named fault in this file.
+ * - What I did: I kept the audit logic. I re-read the request path and the start-up path and changed three things:
+ *     1. A body that starts with a UTF-8 byte-order mark (some spreadsheet exports write one) made
+ *        JSON.parse throw "Unexpected token", so the ledger was refused. The BOM is now stripped first.
+ *     2. server.listen had no 'error' handler. If port 3000 was taken, the process crashed with an unhandled
+ *        EADDRINUSE stack trace. It now prints "port 3000 is already in use" and exits with code 1.
+ *     3. Request and header timeouts are now set (60 s and 30 s), so a stalled client on the private network
+ *        cannot hold a socket open forever.
+ * - What I found / not verified: I wrote this in a text-only seat. I have NOT run `node server.js` and have
+ *   not sent any request to it, so I quote no output. Before this is put forward, the lead or the reviewer
+ *   should run it and POST a sample ledger, for example:
+ *     curl -s -X POST http://<host>:3000/audit -H 'Content-Type: application/json' \
+ *       -d '[{"id":"I1","date":"2026-01-05","customer":"Acme","type":"invoice","amount":1000},
+ *            {"id":"P1","date":"2026-01-20","customer":"Acme","type":"payment","amount":900}]'
+ *   Expected: one leak with kind "unpaid_balance", customer "Acme", balance 100.
+ * - Built: one Node HTTP server. It uses only the standard library ('http') and has no dependencies.
  *   It listens on port 3000 on every interface. With no host argument, Node binds IPv6 "::" dual-stack,
- *   which also accepts IPv4, and falls back to 0.0.0.0 when IPv6 is unavailable.
+ *   which also accepts IPv4 from other machines, and falls back to 0.0.0.0 when IPv6 is unavailable.
  *   It makes no outbound connections, reads no environment variables, files or secrets, and starts no processes.
- * - Endpoint: POST /audit. The body is a JSON array of entries
- *   [{id, date, customer, type: "invoice"|"payment", amount}].
- *   The server also accepts {"entries":[...]}.
- *   It returns {"leaks":[{id, description, customer, balance, ...extra detail}], "summary":{...}}.
- *   GET / returns a short description of the service.
+ * - Endpoint: POST /audit. The body is a JSON array of [{id, date, customer, type: "invoice"|"payment", amount}].
+ *   {"entries":[...]} is also accepted.
+ *   It returns {"leaks":[{id, description, customer, balance, ...detail}], "summary":{...}}.
+ *   GET / describes the service.
  * - Made outside the repository: nothing. There are no contracts, services, accounts or keys,
- *   so there is nothing for the poster to take over beyond this file.
+ *   so there is nothing to take over beyond this file.
  * - Asked of the owner: nothing. No secret is needed or read.
- * - Why this version exists: the previous version was refused because the security reviewer's reply was
- *   not read as a clear APPROVE or REFUSE. The reviewer's text found no security fault in the code.
- *   While re-reading the code I fixed three faults:
- *     1. Math.min(...array) over every entry date. On a large body (tens of thousands of entries) this can
- *        throw RangeError "Maximum call stack size exceeded". Both uses (periodStart/periodEnd and
- *        earliestLeak) are now plain loops.
- *     2. OPTIONS answered 204 with a Content-Length of 2 and a "{}" body. A 204 must carry no body,
- *        so it now sends headers only.
- *     3. A 413 (body too large) answer could be followed by a second write attempt from the 'error'
- *        handler. Responses are now guarded by res.headersSent.
- * - Not verified: I wrote this file in a text-only seat and could not run it. I have not started the
- *   server or sent any request to it, so I cannot quote any real output. The lead or the reviewer should
- *   run `node server.js` and POST a sample ledger before this is put forward.
  *
  * ASSUMPTIONS (the job left these open, so I chose the smallest honest reading)
- * - "balance" on every leak is that customer's net ledger balance: sum of invoices minus sum of payments.
- *   It uses the customer string exactly as written and counts only valid entries.
- *   A positive balance means money is owed to the agency (unpaid or short-paid work).
- *   A negative balance means the agency holds unapplied or over-received cash (a refund liability or misposting).
- * - A customer whose invoices and payments net to exactly 0 has no balance leak.
+ * - "balance" on every leak is that customer's net balance: invoices minus payments.
+ *   It uses the exact customer string and counts valid entries only.
+ *   A positive balance is owed to the agency. A negative balance is cash over-received or misposted.
+ * - A customer who nets to exactly 0 has no balance leak.
  * - Payments are applied first-in-first-out to the oldest open invoice.
- *   This allocation decides which invoice is "open", how old it is, and when a leak began.
- * - Ages are measured against the latest date in the submitted data, not against today,
- *   so the same input always produces the same output.
- * - These entries cannot be trusted, are reported as leaks, and are excluded from balances:
- *   a missing or non-numeric amount, a negative amount, an unparseable date, an unknown type,
- *   or a missing customer.
- * - Duplicate ids and same-day identical postings ARE counted in balances, because they are on the books.
- *   They are also flagged as their own leak, so the double count is visible.
+ *   This decides which invoices are open and when a leak began.
+ * - Ages are measured against the latest date in the submitted data, not today, so output is reproducible.
+ * - These entries are reported as leaks and excluded from balances: a missing or non-numeric amount,
+ *   a negative amount, an unparseable date, an unknown type, or a missing customer.
+ * - Duplicate ids and same-day identical postings are counted in balances (they are on the books)
+ *   and flagged as leaks of their own.
  * - Zero-amount invoices are flagged as possibly unbilled work.
- * - Name variants such as "Acme Ltd" and "acme ltd " are flagged but not merged.
+ * - Customer name variants ("Acme Ltd" / "acme ltd ") are flagged, not merged.
  */
 
 const http = require('http');
@@ -59,7 +59,7 @@ const fromCents = (c) => Math.round(c) / 100;
 const fmt = (c) => (c < 0 ? '-' : '') + (Math.abs(c) / 100).toFixed(2);
 const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 const monthOf = (ms) => new Date(ms).toISOString().slice(0, 7);
-const normName = (s) => s.trim().toLowerCase().replace(/\s+/g, ' ');
+const normName = (s) => String(s).trim().toLowerCase().replace(/\s+/g, ' ');
 
 function minMax(nums) {
   let min = null, max = null;
@@ -89,7 +89,7 @@ function audit(raw) {
   const leaks = [];
   const valid = [];
   const invalid = [];
-  const idSeen = new Map(); // id -> first index
+  const idSeen = new Map();
   const dupIdHits = [];
 
   raw.forEach((e, i) => {
@@ -120,17 +120,13 @@ function audit(raw) {
     if (idSeen.has(id)) dupIdHits.push({ index: i, id, firstIndex: idSeen.get(id) });
     else idSeen.set(id, i);
 
-    if (problems.length) {
-      invalid.push({ index: i, id, customer, type, amount: e.amount, date: e.date, problems });
-    } else {
-      valid.push({ index: i, id, customer, type, cents, date });
-    }
+    if (problems.length) invalid.push({ index: i, id, customer, type, amount: e.amount, date: e.date, problems });
+    else valid.push({ index: i, id, customer, type, cents, date });
   });
 
   const [periodStart, periodEnd] = minMax(valid.map((r) => r.date));
   const ageAt = (d) => (periodEnd === null || d === null ? null : Math.round((periodEnd - d) / DAY));
 
-  // Group by exact customer string.
   const byCustomer = new Map();
   for (const r of valid) {
     if (!byCustomer.has(r.customer)) byCustomer.set(r.customer, []);
@@ -142,8 +138,8 @@ function audit(raw) {
 
   for (const [customer, recs] of byCustomer) {
     recs.sort((a, b) => a.date - b.date || a.index - b.index);
-    const open = []; // invoices with remaining > 0
-    const credit = []; // payments with unapplied remainder
+    const open = [];
+    const credit = [];
     const invoices = [];
     let invoiced = 0, paid = 0;
     for (const r of recs) {
@@ -180,19 +176,20 @@ function audit(raw) {
   }
 
   const balOf = (customer) => (custInfo.has(customer) ? custInfo.get(customer).balance : 0);
-  const leakOrigins = []; // {date, cents, kind}
+  const leakOrigins = [];
 
   // 1) Customer balance leaks
   for (const info of custInfo.values()) {
     if (info.balance === 0) continue;
-    if (info.balance > 0) {
+    if (info.balance > 0 && info.open.length) {
       const oldest = info.open[0];
       const shortPaid = info.open.filter((i) => i.remaining < i.original);
       const unpaid = info.open.filter((i) => i.remaining === i.original);
       const shortAmounts = new Map();
       for (const s of shortPaid) shortAmounts.set(s.remaining, (shortAmounts.get(s.remaining) || 0) + 1);
       const repeated = [...shortAmounts].filter(([, n]) => n >= 2);
-      const lastPayment = [...info.recs].reverse().find((r) => r.type === 'payment');
+      let lastPayment = null;
+      for (let k = info.recs.length - 1; k >= 0; k--) if (info.recs[k].type === 'payment') { lastPayment = info.recs[k]; break; }
       let d = `Customer "${info.customer}" owes ${fmt(info.balance)}: invoiced ${fmt(info.invoiced)}, paid ${fmt(info.paid)}. ` +
         `Outstanding since ${isoDay(oldest.date)} (invoice ${oldest.id}, ${ageAt(oldest.date)} days before the last ledger date ${isoDay(periodEnd)}). ` +
         `${info.open.length} open invoice(s): ${info.open.map((i) => `${i.id} ${isoDay(i.date)} ${fmt(i.remaining)} of ${fmt(i.original)}`).join('; ')}.`;
@@ -201,14 +198,15 @@ function audit(raw) {
       if (repeated.length) d += ` Pattern: the same shortfall recurs (${repeated.map(([c, n]) => `${fmt(c)} x${n}`).join(', ')}), which points to a systematic deduction (bank/transfer fees, an unrecorded discount, or withholding) rather than a one-off.`;
       if (!lastPayment) d += ' No payment has ever been recorded for this customer.';
       else if (lastPayment.date < oldest.date) d += ` The last payment (${lastPayment.id}, ${isoDay(lastPayment.date)}) predates every open invoice, so payment stopped while billing continued.`;
+      const age = ageAt(oldest.date);
       leaks.push({
         id: oldest.id, description: d, customer: info.customer, balance: fromCents(info.balance),
-        kind: 'unpaid_balance', severity: ageAt(oldest.date) > 90 ? 'high' : ageAt(oldest.date) > 30 ? 'medium' : 'low',
-        amount: fromCents(info.balance), since: isoDay(oldest.date), ageDays: ageAt(oldest.date),
+        kind: 'unpaid_balance', severity: age > 90 ? 'high' : age > 30 ? 'medium' : 'low',
+        amount: fromCents(info.balance), since: isoDay(oldest.date), ageDays: age,
         relatedIds: info.open.map((i) => i.id),
       });
       for (const i of info.open) leakOrigins.push({ date: i.date, cents: i.remaining, kind: 'unpaid_balance' });
-    } else {
+    } else if (info.balance < 0 && info.credit.length) {
       const first = info.credit[0];
       const over = -info.balance;
       let d = `Customer "${info.customer}" has ${fmt(over)} more paid than invoiced: invoiced ${fmt(info.invoiced)}, paid ${fmt(info.paid)}. ` +
@@ -335,7 +333,8 @@ function audit(raw) {
   if (multiOpen.length) patterns.push(`Repeat non-payment: ${multiOpen.map((c) => `"${c.customer}" (${c.open.length} open invoices)`).join(', ')}. Consider credit holds before further work.`);
   const totalUnder = [...custInfo.values()].filter((c) => c.balance > 0).reduce((s, c) => s + c.balance, 0);
   const totalOver = [...custInfo.values()].filter((c) => c.balance < 0).reduce((s, c) => s - c.balance, 0);
-  const topDebtor = [...custInfo.values()].sort((a, b) => b.balance - a.balance)[0];
+  let topDebtor = null;
+  for (const c of custInfo.values()) if (!topDebtor || c.balance > topDebtor.balance) topDebtor = c;
   if (topDebtor && topDebtor.balance > 0 && totalUnder > 0) {
     patterns.push(`"${topDebtor.customer}" accounts for ${Math.round((topDebtor.balance / totalUnder) * 100)}% of money owed (${fmt(topDebtor.balance)} of ${fmt(totalUnder)}).`);
   }
@@ -417,8 +416,11 @@ const server = http.createServer((req, res) => {
   req.on('end', () => {
     if (aborted) return;
     let data;
-    try { data = JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null'); }
-    catch (e) { return send(res, 400, { error: 'invalid JSON: ' + e.message, leaks: [] }); }
+    try {
+      let text = Buffer.concat(chunks).toString('utf8');
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+      data = JSON.parse(text.trim() || 'null');
+    } catch (e) { return send(res, 400, { error: 'invalid JSON: ' + e.message, leaks: [] }); }
     const entries = Array.isArray(data) ? data : data && Array.isArray(data.entries) ? data.entries : null;
     if (!entries) return send(res, 400, { error: 'body must be a JSON array of entries (or {"entries": [...]})', leaks: [] });
     try { send(res, 200, audit(entries)); }
@@ -429,6 +431,15 @@ const server = http.createServer((req, res) => {
     aborted = true;
     send(res, 400, { error: 'request error', leaks: [] });
   });
+});
+
+server.requestTimeout = 60000;
+server.headersTimeout = 30000;
+
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') console.error(`port ${PORT} is already in use`);
+  else console.error('server error: ' + (err && err.message));
+  process.exit(1);
 });
 
 // No host argument: Node binds every interface (IPv6 "::" dual-stack, or 0.0.0.0 when IPv6 is unavailable).
